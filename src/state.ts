@@ -17,66 +17,54 @@ export interface CacheStatus {
 }
 
 export function isVisibleAssistant(msg: unknown): msg is AssistantMessage {
-  if (!msg || typeof msg !== "object") return false;
-  const a = msg as AssistantMessage;
-  return a.role === "assistant" && a.stopReason !== "error" && a.stopReason !== "aborted";
+  const a = msg as AssistantMessage | undefined;
+  return Boolean(a && a.role === "assistant" && a.stopReason !== "error" && a.stopReason !== "aborted");
 }
 
 export function isEditableEntry(entry: SessionEntry): boolean {
   if (entry.type === "custom_message") return true;
   if (entry.type !== "message") return false;
-  const role = entry.message.role;
-  return role === "user" || role === "assistant" || role === "toolResult";
+  const r = entry.message.role;
+  return r === "user" || r === "assistant" || r === "toolResult";
 }
 
 export function reconstructState(branchEntries: readonly SessionEntry[]): DcpStateData {
   let start = 0;
   for (let i = branchEntries.length - 1; i >= 0; i--) {
-    if (branchEntries[i]!.type === "compaction") {
-      start = i + 1;
-      break;
-    }
+    if (branchEntries[i]!.type === "compaction") { start = i + 1; break; }
   }
-  const activeSlice = branchEntries.slice(start);
-  const activeIds = new Set(activeSlice.map((e) => e.id));
-  for (let i = activeSlice.length - 1; i >= 0; i--) {
-    const entry = activeSlice[i]!;
+  const active = branchEntries.slice(start);
+  const activeIds = new Set(active.map((e) => e.id));
+  for (let i = active.length - 1; i >= 0; i--) {
+    const entry = active[i]!;
     if (entry.type !== "custom" || entry.customType !== STATE_CUSTOM_TYPE) continue;
     const raw = entry.data as Partial<DcpStateData> | undefined;
     if (!raw || raw.version !== 1) continue;
-    const filterIds = (ids: unknown): string[] =>
+    const keep = (ids: unknown): string[] =>
       Array.isArray(ids) ? [...new Set(ids.filter((id): id is string => typeof id === "string" && activeIds.has(id)))] : [];
+    const pick = (id: unknown): string | null => (typeof id === "string" && activeIds.has(id) ? id : null);
     return {
       version: 1,
-      lastFoldEndEntryId: typeof raw.lastFoldEndEntryId === "string" && activeIds.has(raw.lastFoldEndEntryId) ? raw.lastFoldEndEntryId : null,
-      foldTurnEntryIds: filterIds(raw.foldTurnEntryIds),
-      prunedEntryIds: filterIds(raw.prunedEntryIds),
+      lastFoldEndEntryId: pick(raw.lastFoldEndEntryId),
+      foldTurnEntryIds: keep(raw.foldTurnEntryIds),
+      prunedEntryIds: keep(raw.prunedEntryIds),
       foldCount: typeof raw.foldCount === "number" && Number.isInteger(raw.foldCount) && raw.foldCount >= 0 ? raw.foldCount : 0,
-      lastNudgeEntryId: typeof raw.lastNudgeEntryId === "string" && activeIds.has(raw.lastNudgeEntryId) ? raw.lastNudgeEntryId : null,
+      lastNudgeEntryId: pick(raw.lastNudgeEntryId),
     };
   }
   return createEmptyState();
 }
 
-export function buildToolCallIndex(contextEntries: readonly ProjectedSessionEntry[]): {
-  byCallId: Map<string, ToolCallInfo>;
-  resultEntryIdsByCallId: Map<string, string[]>;
-} {
+export function buildToolCallIndex(contextEntries: readonly ProjectedSessionEntry[]) {
   const byCallId = new Map<string, ToolCallInfo>();
   const resultEntryIdsByCallId = new Map<string, string[]>();
   for (let i = 0; i < contextEntries.length; i++) {
     const pe = contextEntries[i]!;
     for (const msg of pe.messages) {
       if (isVisibleAssistant(msg)) {
-        for (const block of msg.content) {
-          if (block.type === "toolCall") {
-            byCallId.set(block.id, {
-              callId: block.id,
-              name: block.name,
-              arguments: (block.arguments ?? {}) as Record<string, unknown>,
-              assistantEntryId: pe.sourceEntry.id,
-              assistantIndex: i,
-            });
+        for (const b of msg.content) {
+          if (b.type === "toolCall") {
+            byCallId.set(b.id, { callId: b.id, name: b.name, arguments: (b.arguments ?? {}) as Record<string, unknown>, assistantEntryId: pe.sourceEntry.id, assistantIndex: i });
           }
         }
       } else if (msg.role === "toolResult") {
@@ -90,60 +78,37 @@ export function buildToolCallIndex(contextEntries: readonly ProjectedSessionEntr
 }
 
 export function detectCacheStatus(contextEntries: readonly ProjectedSessionEntry[], cacheTtlMs: number): CacheStatus {
-  const assistants: AssistantMessage[] = [];
-  for (let i = contextEntries.length - 1; i >= 0 && assistants.length < 2; i--) {
+  const found: AssistantMessage[] = [];
+  for (let i = contextEntries.length - 1; i >= 0 && found.length < 2; i--) {
     for (const msg of contextEntries[i]!.messages) {
-      if (isVisibleAssistant(msg)) {
-        assistants.push(msg);
-        if (assistants.length === 2) break;
-      }
+      if (isVisibleAssistant(msg)) { found.push(msg); if (found.length === 2) break; }
     }
   }
-  const latest = assistants[0];
+  const latest = found[0];
   if (!latest) return { isCold: false, prevCacheRead: null, gapMs: null };
-  const prev = assistants[1];
-  const gapMs = prev ? latest.timestamp - prev.timestamp : null;
+  const gapMs = found[1] ? latest.timestamp - found[1].timestamp : null;
   const cacheRead = typeof latest.usage?.cacheRead === "number" ? latest.usage.cacheRead : null;
   const cacheWrite = typeof latest.usage?.cacheWrite === "number" ? latest.usage.cacheWrite : 0;
-  const explicitCold = cacheRead === 0 && cacheWrite > 0;
-  const ttlCold = gapMs !== null && gapMs > cacheTtlMs;
-  return { isCold: explicitCold || ttlCold, prevCacheRead: cacheRead, gapMs };
+  return { isCold: (cacheRead === 0 && cacheWrite > 0) || (gapMs !== null && gapMs > cacheTtlMs), prevCacheRead: cacheRead, gapMs };
 }
 
-export function sanitizeContextEditDrafts(
-  drafts: readonly ContextEditEntryDraft[],
-  contextEntries: readonly ProjectedSessionEntry[],
-): ContextEditEntryDraft[] {
-  const validTargets = new Set<string>();
-  for (const pe of contextEntries) {
-    if (pe.messages.length > 0 && isEditableEntry(pe.sourceEntry)) validTargets.add(pe.sourceEntry.id);
-  }
+export function sanitizeContextEditDrafts(drafts: readonly ContextEditEntryDraft[], contextEntries: readonly ProjectedSessionEntry[]): ContextEditEntryDraft[] {
+  const valid = new Set(contextEntries.filter((pe) => pe.messages.length > 0 && isEditableEntry(pe.sourceEntry)).map((pe) => pe.sourceEntry.id));
   const byTarget = new Map<string, ContextEditEntryDraft>();
-  for (const draft of drafts) {
-    if (!validTargets.has(draft.targetId)) continue;
-    const r = draft.replacement;
-    const validReplacement = r === null || (typeof r === "object" && "content" in r && (typeof r.content === "string" || Array.isArray(r.content)));
-    if (!validReplacement) continue;
-    const prev = byTarget.get(draft.targetId);
-    if (prev && prev.replacement === null) continue;
-    byTarget.set(draft.targetId, draft);
+  for (const d of drafts) {
+    if (!valid.has(d.targetId)) continue;
+    const r = d.replacement;
+    if (r !== null && (typeof r !== "object" || !("content" in r) || (typeof r.content !== "string" && !Array.isArray(r.content)))) continue;
+    if (byTarget.get(d.targetId)?.replacement === null) continue;
+    byTarget.set(d.targetId, d);
   }
   return [...byTarget.values()];
 }
 
-export function countAssistantTurnsSince(
-  contextEntries: readonly ProjectedSessionEntry[],
-  sinceEntryIds: readonly (string | null)[],
-): number {
-  let startIdx = -1;
-  for (const id of sinceEntryIds) {
-    if (!id) continue;
-    const idx = contextEntries.findIndex((pe) => pe.sourceEntry.id === id);
-    if (idx > startIdx) startIdx = idx;
-  }
+export function countAssistantTurnsSince(contextEntries: readonly ProjectedSessionEntry[], sinceEntryIds: readonly (string | null)[]): number {
+  let start = -1;
+  for (const id of sinceEntryIds) if (id) start = Math.max(start, contextEntries.findIndex((pe) => pe.sourceEntry.id === id));
   let turns = 0;
-  for (let i = startIdx + 1; i < contextEntries.length; i++) {
-    if (contextEntries[i]!.messages.some((m) => isVisibleAssistant(m))) turns++;
-  }
+  for (let i = start + 1; i < contextEntries.length; i++) if (contextEntries[i]!.messages.some(isVisibleAssistant)) turns++;
   return turns;
 }

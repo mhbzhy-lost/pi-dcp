@@ -37,7 +37,7 @@ interface Candidate {
 
 const DEFAULT_READ_CAP = 2000;
 
-function readRange(args?: Record<string, unknown>): { rawPath: string; start: number; end: number; label: string } | null {
+function readRange(args?: Record<string, unknown>) {
   if (!args || typeof args.path !== "string" || !args.path.trim()) return null;
   const start = typeof args.offset === "number" && args.offset >= 1 ? Math.floor(args.offset) : 1;
   const limit = typeof args.limit === "number" && args.limit >= 1 ? Math.min(Math.floor(args.limit), DEFAULT_READ_CAP) : DEFAULT_READ_CAP;
@@ -46,54 +46,36 @@ function readRange(args?: Record<string, unknown>): { rawPath: string; start: nu
 }
 
 function computeTailCutIndex(entries: readonly ProjectedSessionEntry[], protectTurns: number, protectTokens: number): number {
-  let turnCut = entries.length;
-  let seenTurns = 0;
+  let turnCut = entries.length, tokCut = entries.length, seenTurns = 0, seenTok = 0;
   for (let i = entries.length - 1; i >= 0; i--) {
-    if (entries[i]!.messages.some((m) => isVisibleAssistant(m))) {
-      seenTurns++;
-      if (seenTurns >= protectTurns) {
-        turnCut = i;
-        break;
-      }
+    const msgs = entries[i]!.messages;
+    if (protectTurns > 0 && turnCut === entries.length && msgs.some(isVisibleAssistant) && ++seenTurns >= protectTurns) turnCut = i;
+    if (protectTokens > 0 && tokCut === entries.length) {
+      for (const m of msgs) seenTok += estimateTokens(m);
+      if (seenTok >= protectTokens) tokCut = i;
     }
+    if (turnCut < entries.length && tokCut < entries.length) break;
   }
-  if (protectTurns === 0) turnCut = entries.length;
-  let tokCut = entries.length;
-  let seenTok = 0;
-  for (let i = entries.length - 1; i >= 0; i--) {
-    for (const m of entries[i]!.messages) seenTok += estimateTokens(m);
-    if (seenTok >= protectTokens) {
-      tokCut = i;
-      break;
-    }
-  }
-  if (protectTokens === 0) tokCut = entries.length;
   return Math.min(turnCut, tokCut);
 }
 
 function findSupersedingTool(
-  entryIdx: number,
-  normPath: string,
-  start: number,
-  end: number,
-  entries: readonly ProjectedSessionEntry[],
-  byCallId: Map<string, ToolCallInfo>,
-  cwd: string,
+  entryIdx: number, normPath: string, start: number, end: number,
+  entries: readonly ProjectedSessionEntry[], byCallId: Map<string, ToolCallInfo>, cwd: string,
 ): string | undefined {
   for (let j = entryIdx + 1; j < entries.length; j++) {
     for (const msg of entries[j]!.messages) {
       if (msg.role !== "toolResult" || msg.isError) continue;
       const call = byCallId.get(msg.toolCallId);
       if (!call) continue;
-      if ((call.name === "edit" || call.name === "write") && typeof call.arguments.path === "string") {
-        if (path.resolve(cwd, call.arguments.path) === normPath) return call.name;
-      } else if (call.name === "read") {
+      if ((call.name === "edit" || call.name === "write") && typeof call.arguments.path === "string" && path.resolve(cwd, call.arguments.path) === normPath) {
+        return call.name;
+      }
+      if (call.name === "read") {
         const later = readRange(call.arguments);
         if (!later || path.resolve(cwd, later.rawPath) !== normPath) continue;
-        const details = msg.details as { truncation?: { truncated?: boolean; outputLines?: number } } | undefined;
-        const effectiveEnd = details?.truncation?.truncated && typeof details.truncation.outputLines === "number"
-          ? later.start + details.truncation.outputLines - 1
-          : later.end;
+        const tr = (msg.details as { truncation?: { truncated?: boolean; outputLines?: number } } | undefined)?.truncation;
+        const effectiveEnd = tr?.truncated && typeof tr.outputLines === "number" ? later.start + tr.outputLines - 1 : later.end;
         if (later.start <= start && effectiveEnd >= end) return "read";
       }
     }
@@ -103,17 +85,13 @@ function findSupersedingTool(
 
 function spillBash(text: string, config: DcpConfig, sessionId: string, entryId: string): string | undefined {
   if (!config.spillBashOutput) return undefined;
-  const base = config.spillDir ?? path.join(os.tmpdir(), "pi-dcp-spill");
-  const safeSession = sessionId.replace(/[^a-zA-Z0-9._-]/g, "_") || "session";
-  const dir = path.join(base, safeSession);
+  const dir = path.join(config.spillDir ?? path.join(os.tmpdir(), "pi-dcp-spill"), sessionId.replace(/[^a-zA-Z0-9._-]/g, "_") || "session");
   const filePath = path.join(dir, `${entryId}.log`);
   try {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     fs.writeFileSync(filePath, text, { encoding: "utf8", mode: 0o600 });
     return filePath;
-  } catch {
-    return undefined;
-  }
+  } catch { return undefined; }
 }
 
 function buildPlaceholder(c: Candidate, config: DcpConfig, sessionId: string, doSpill: boolean): string {
@@ -123,18 +101,14 @@ function buildPlaceholder(c: Candidate, config: DcpConfig, sessionId: string, do
   }
   if (c.msg.toolName === "bash") {
     const nativePath = (c.msg.details as { fullOutputPath?: unknown } | undefined)?.fullOutputPath;
-    const resolved = typeof nativePath === "string" && nativePath.trim()
-      ? nativePath
-      : doSpill ? spillBash(c.text, config, sessionId, c.entryId) : undefined;
-    const cmd = typeof c.call?.arguments.command === "string" ? c.call.arguments.command : "bash";
-    return formatBashPlaceholder(cmd, c.lines, c.tokens, resolved);
+    const resolved = typeof nativePath === "string" && nativePath.trim() ? nativePath : doSpill ? spillBash(c.text, config, sessionId, c.entryId) : undefined;
+    return formatBashPlaceholder(typeof c.call?.arguments.command === "string" ? c.call.arguments.command : "bash", c.lines, c.tokens, resolved);
   }
   if (c.msg.toolName === "read") {
     const r = readRange(c.call?.arguments);
     return formatToolPlaceholder("read", `${r?.rawPath ?? "file"}${r?.label ?? ""}`, c.lines, c.tokens);
   }
-  const argPreview = c.call ? JSON.stringify(c.call.arguments).slice(0, 60) : "";
-  return formatToolPlaceholder(c.msg.toolName, argPreview || "output", c.lines, c.tokens);
+  return formatToolPlaceholder(c.msg.toolName, (c.call ? JSON.stringify(c.call.arguments).slice(0, 60) : "") || "output", c.lines, c.tokens);
 }
 
 export function planL1Prune(input: L1PruneInput): L1PruneOutput {
@@ -152,40 +126,27 @@ export function planL1Prune(input: L1PruneInput): L1PruneOutput {
     const entryId = pe.sourceEntry.id;
     if (pe.messages.length !== 1 || prunedSet.has(entryId) || excludeEntryIds?.has(entryId)) continue;
     const msg = pe.messages[0]!;
-    if (msg.role !== "toolResult" || msg.isError || protectedSet.has(msg.toolName)) continue;
-    if (msg.content.some((b) => b.type === "image")) continue;
+    if (msg.role !== "toolResult" || msg.isError || protectedSet.has(msg.toolName) || msg.content.some((b) => b.type === "image")) continue;
     const text = msg.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
     const tokens = estimateTokens(msg);
     const call = byCallId.get(msg.toolCallId);
-    let staleBy: string | undefined;
-    if (msg.toolName === "read" && tokens >= config.minStaleReadTokens && call) {
-      const r = readRange(call.arguments);
-      if (r) staleBy = findSupersedingTool(i, path.resolve(cwd, r.rawPath), r.start, r.end, contextEntries, byCallId, cwd);
-    }
+    const r = msg.toolName === "read" && tokens >= config.minStaleReadTokens ? readRange(call?.arguments) : null;
+    const staleBy = r ? findSupersedingTool(i, path.resolve(cwd, r.rawPath), r.start, r.end, contextEntries, byCallId, cwd) : undefined;
     if (!staleBy && tokens < config.oversizedToolTokens) continue;
     candidates.push({ index: i, entryId, msg, text, lines: text ? text.split("\n").length : 0, tokens, call, staleBy });
   }
   if (!candidates.length) return empty;
 
   const { isCold } = detectCacheStatus(contextEntries, config.cacheTtlMs);
-  const calcSavings = (list: Candidate[]): number =>
-    list.reduce((sum, c) => sum + Math.max(0, c.tokens - Math.ceil(buildPlaceholder(c, config, sessionId, false).length / 4)), 0);
-
+  const calcSavings = (list: Candidate[]) => list.reduce((s, c) => s + Math.max(0, c.tokens - Math.ceil(buildPlaceholder(c, config, sessionId, false).length / 4)), 0);
+  const allSavings = calcSavings(candidates);
   let selected: Candidate[] = [];
   let reason: L1PruneOutput["reason"] = "none";
-  const allSavings = calcSavings(candidates);
-  if (isCold && allSavings >= config.coldCacheMinSaveTokens) {
-    selected = candidates;
-    reason = "cold-cache";
-  } else if (allSavings >= config.minBatchSaveTokens) {
-    selected = candidates;
-    reason = "min-batch";
-  } else if (piggybackAfterIndex !== undefined) {
-    const piggyList = isCold ? candidates : candidates.filter((c) => c.index > piggybackAfterIndex);
-    if (piggyList.length && calcSavings(piggyList) > 0) {
-      selected = piggyList;
-      reason = "piggyback";
-    }
+  if (isCold && allSavings >= config.coldCacheMinSaveTokens) { selected = candidates; reason = "cold-cache"; }
+  else if (allSavings >= config.minBatchSaveTokens) { selected = candidates; reason = "min-batch"; }
+  else if (piggybackAfterIndex !== undefined) {
+    const piggy = isCold ? candidates : candidates.filter((c) => c.index > piggybackAfterIndex);
+    if (piggy.length && calcSavings(piggy) > 0) { selected = piggy; reason = "piggyback"; }
   }
   if (!selected.length) return empty;
 
