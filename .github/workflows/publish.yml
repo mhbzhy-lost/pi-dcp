@@ -1,0 +1,58 @@
+# npm Trusted Publishing (OIDC) release workflow for @mhbzhy-lost/pi-dcp.
+#
+# One-time setup on https://www.npmjs.com/ after registering your npm account:
+# 1. Publish the initial package (or claim the package) under your npm scope.
+# 2. In Package Settings -> Publishing access -> Trusted Publisher (GitHub Actions):
+#    - Organization or user: mhbzhy-lost
+#    - Repository: pi-dcp
+#    - Workflow filename: publish.yml
+#    - Environment name: (leave empty)
+# Until a valid npm account and Trusted Publisher are configured, the publish step
+# is expected to fail with an authentication/permission error.
+
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Verify tag matches package.json version
+        if: github.ref_type == 'tag'
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "v${PKG_VERSION}" != "${GITHUB_REF_NAME}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package.json version v${PKG_VERSION}" >&2
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Verify package
+        run: |
+          npm run typecheck
+          npm run check:loc
+          npm test
+          npm pack --dry-run
+
+      - name: Publish to npm (OIDC Trusted Publishing)
+        run: npm publish --provenance --access public
