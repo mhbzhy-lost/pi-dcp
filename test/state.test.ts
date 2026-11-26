@@ -5,13 +5,16 @@ import path from "node:path";
 import test from "node:test";
 import { DEFAULT_CONFIG, loadConfig } from "../src/types.ts";
 
-test("package.json declares pi.extensions pointing to ./index.ts and type module", () => {
+test("package.json declares pi.extensions pointing to ./index.ts, type module, and exact pinned pi devDependencies", () => {
   const pkg = JSON.parse(fs.readFileSync(path.resolve("package.json"), "utf8"));
   assert.equal(pkg.name, "@mhbzhy-lost/pi-dcp");
   assert.equal(pkg.type, "module");
   assert.equal(pkg.license, "MIT");
   assert.deepEqual(pkg.pi, { extensions: ["./index.ts"] });
   assert.equal(pkg.dependencies, undefined);
+  assert.match(pkg.devDependencies["@earendil-works/pi-coding-agent"], /^\d+\.\d+\.\d+$/);
+  assert.match(pkg.devDependencies["@earendil-works/pi-agent-core"], /^\d+\.\d+\.\d+$/);
+  assert.match(pkg.devDependencies["@earendil-works/pi-ai"], /^\d+\.\d+\.\d+$/);
 });
 
 test("loadConfig returns DEFAULT_CONFIG when no config files exist", () => {

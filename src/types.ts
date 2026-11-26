@@ -38,6 +38,7 @@ export interface DcpStateData {
 }
 
 export interface PendingCompressPlan {
+  toolCallId: string;
   topic: string;
   summary: string;
   foldedEntryIds: string[];

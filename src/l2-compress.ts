@@ -126,7 +126,7 @@ export function planMonotoneFold(params: {
     const foldedEntryIds = sortedIdx.map((i) => contextEntries[i]!.sourceEntry.id);
     return {
       ok: true,
-      plan: { topic, summary, foldedEntryIds, endEntryId: foldedEntryIds[foldedEntryIds.length - 1]!, foldedAfterLastUser, keepRecentTurns, preservedUsersText, compressedTokens, summaryTokens, foldNumber: state.foldCount + 1 },
+      plan: { toolCallId: currentToolCallId, topic, summary, foldedEntryIds, endEntryId: foldedEntryIds[foldedEntryIds.length - 1]!, foldedAfterLastUser, keepRecentTurns, preservedUsersText, compressedTokens, summaryTokens, foldNumber: state.foldCount + 1 },
     };
   };
 

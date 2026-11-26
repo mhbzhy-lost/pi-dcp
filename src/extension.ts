@@ -42,9 +42,12 @@ export function registerPiDcp(pi: ExtensionAPI, options?: { cwd?: string; agentD
   }
 
   pi.on("turn_end", (event, ctx) => {
-    const plan = pendingCompress;
+    const rawPlan = pendingCompress;
     pendingCompress = null;
     if (event.outcome !== "completed") return undefined;
+    const plan = rawPlan && event.message.role === "assistant" && event.message.content.some((b) => b.type === "toolCall" && b.id === rawPlan.toolCallId)
+      ? rawPlan
+      : null;
 
     const contextEntries = event.context.contextEntries;
     const state = reconstructState(ctx.sessionManager.getBranch());

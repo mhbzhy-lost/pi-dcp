@@ -21,6 +21,10 @@ Minimal, Pi 1.6.1-native tail-local context pruning and monotone folding extensi
 
 Defaults work out of the box. Optional overrides in `${PI_CODING_AGENT_DIR:-~/.pi/agent}/dcp.json` and `<cwd>/.pi/dcp.json` (project overrides global; invalid JSON or keys warn and fall back to defaults without disabling the extension).
 
+- Note: `<cwd>/.pi/dcp.json` is resolved against `process.cwd()` at extension load time.
+- Note: setting `protectedTools` replaces the default list (`["subagent", "compress"]`), so include `"compress"` and `"subagent"` if you want to keep them protected.
+- Note: `devDependencies` pin `@earendil-works/pi-*@1.6.0` (latest public npm release) for deterministic local tests; `peerDependencies` use `"*"` so runtime always uses the host Pi (`>= 1.6.0` / `1.6.1`).
+
 ## Development
 
 ```bash

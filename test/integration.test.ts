@@ -252,3 +252,23 @@ test("tail nudge fires only during tool loop when percent >= nudgePercent and >=
   void (null as unknown as AssistantMessage);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test("turn_end ignores leaked pendingCompress if event.message does not contain the matching compress toolCallId", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dcp-int-leak-"));
+  const sm = createSession(dir);
+  const h = createHarness(dir, { agentDir: path.join(dir, "agent") });
+  const ctx = makeCtx(sm);
+
+  sm.appendMessage(makeUser("Initial"));
+  sm.appendMessage(makeAssistant({ toolCalls: [makeToolCall("c1", "read", { path: "a.ts" })] }));
+  sm.appendMessage(makeToolResult({ toolCallId: "c1", toolName: "read", text: repeatTokens(4000) }));
+  sm.appendMessage(makeAssistant({ toolCalls: [makeToolCall("cmp1", "compress", { topic: "Phase", summary: "Summary" })] }));
+  const execRes = await h.tools.get("compress")!.execute("cmp1", { topic: "Phase", summary: "Summary" }, undefined, undefined, ctx as any);
+  assert.notEqual(execRes.isError, true);
+
+  // Simulate host missing turn_end for cmp1 and firing turn_end on a different subsequent assistant turn
+  const otherA = sm.appendMessage(makeAssistant({ text: "unrelated later turn" }));
+  const leakedRes = await h.emit("turn_end", makeTurnEnd(sm, otherA, []), ctx);
+  assert.equal(leakedRes, undefined);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
