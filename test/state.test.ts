@@ -73,3 +73,121 @@ test("loadConfig warns and falls back to defaults on malformed JSON, unknown key
   assert.ok(warnings.length >= 4, `expected >= 4 warnings, got ${warnings.length}: ${warnings.join("; ")}`);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+import { STATE_CUSTOM_TYPE, type DcpStateData } from "../src/types.ts";
+import {
+  buildToolCallIndex,
+  countAssistantTurnsSince,
+  detectCacheStatus,
+  reconstructState,
+  sanitizeContextEditDrafts,
+} from "../src/state.ts";
+import { createSession, makeAssistant, makeToolCall, makeToolResult, makeUser } from "./helpers.ts";
+
+test("reconstructState returns empty state on fresh session and resets after compaction entry", () => {
+  const sm = createSession();
+  const u1 = sm.appendMessage(makeUser("hello"));
+  assert.deepEqual(reconstructState(sm.getBranch()), {
+    version: 1,
+    lastFoldEndEntryId: null,
+    foldTurnEntryIds: [],
+    prunedEntryIds: [],
+    foldCount: 0,
+    lastNudgeEntryId: null,
+  });
+
+  const saved: DcpStateData = {
+    version: 1,
+    lastFoldEndEntryId: u1,
+    foldTurnEntryIds: [u1],
+    prunedEntryIds: [u1],
+    foldCount: 2,
+    lastNudgeEntryId: u1,
+  };
+  sm.appendCustomEntry(STATE_CUSTOM_TYPE, saved);
+  assert.equal(reconstructState(sm.getBranch()).foldCount, 2);
+
+  sm.appendCompaction("summary", u1, 5000);
+  const afterCompact = reconstructState(sm.getBranch());
+  assert.equal(afterCompact.lastFoldEndEntryId, null);
+  assert.equal(afterCompact.foldCount, 0);
+  assert.deepEqual(afterCompact.prunedEntryIds, []);
+  assert.equal(afterCompact.lastNudgeEntryId, null);
+});
+
+test("reconstructState follows active branch after /tree branch switch", () => {
+  const sm = createSession();
+  const u1 = sm.appendMessage(makeUser("root"));
+  const a1 = sm.appendMessage(makeAssistant({ text: "a1" }));
+  sm.appendCustomEntry(STATE_CUSTOM_TYPE, {
+    version: 1,
+    lastFoldEndEntryId: a1,
+    foldTurnEntryIds: [a1],
+    prunedEntryIds: [a1],
+    foldCount: 1,
+    lastNudgeEntryId: a1,
+  } satisfies DcpStateData);
+  const leafA = sm.getLeafId()!;
+
+  sm.branch(u1);
+  sm.appendMessage(makeAssistant({ text: "branchB" }));
+  assert.equal(reconstructState(sm.getBranch()).foldCount, 0);
+
+  sm.branch(leafA);
+  const restored = reconstructState(sm.getBranch());
+  assert.equal(restored.foldCount, 1);
+  assert.equal(restored.lastFoldEndEntryId, a1);
+  assert.equal(restored.lastNudgeEntryId, a1);
+});
+
+test("detectCacheStatus marks cold on cacheRead===0&&cacheWrite>0 or TTL gap, warm/unknown on non-reporting provider", () => {
+  const sm = createSession();
+  sm.appendMessage(makeUser("u1"));
+  sm.appendMessage(makeAssistant({ text: "a1", usage: { cacheRead: 0, cacheWrite: 0 }, timestamp: 1000 }));
+  sm.appendMessage(makeAssistant({ text: "a2", usage: { cacheRead: 0, cacheWrite: 0 }, timestamp: 2000 }));
+  assert.equal(detectCacheStatus(sm.buildSessionProjection().entries, 300_000).isCold, false);
+
+  const smColdWrite = createSession();
+  smColdWrite.appendMessage(makeUser("u1"));
+  smColdWrite.appendMessage(makeAssistant({ text: "a1", usage: { cacheRead: 0, cacheWrite: 5000 }, timestamp: 1000 }));
+  smColdWrite.appendMessage(makeAssistant({ text: "a2", usage: { cacheRead: 0, cacheWrite: 6000 }, timestamp: 2000 }));
+  assert.equal(detectCacheStatus(smColdWrite.buildSessionProjection().entries, 300_000).isCold, true);
+
+  const smTtl = createSession();
+  smTtl.appendMessage(makeUser("u1"));
+  smTtl.appendMessage(makeAssistant({ text: "a1", usage: { cacheRead: 4000, cacheWrite: 0 }, timestamp: 1000 }));
+  smTtl.appendMessage(makeAssistant({ text: "a2", usage: { cacheRead: 4000, cacheWrite: 0 }, timestamp: 400_000 }));
+  assert.equal(detectCacheStatus(smTtl.buildSessionProjection().entries, 300_000).isCold, true);
+});
+
+test("sanitizeContextEditDrafts filters invalid/omitted targets and prefers null over non-null on duplicate targetId", () => {
+  const sm = createSession();
+  const u1 = sm.appendMessage(makeUser("u1"));
+  const a1 = sm.appendMessage(makeAssistant({ toolCalls: [makeToolCall("c1", "read", { path: "a.ts" })] }));
+  const tr1 = sm.appendMessage(makeToolResult({ toolCallId: "c1", toolName: "read", text: "abc" }));
+  const customId = sm.appendCustomEntry("other", { x: 1 });
+  const omittedUser = sm.appendMessage(makeUser("already omitted"));
+  sm.appendContextEdit(omittedUser, null);
+  const projection = sm.buildSessionProjection().entries;
+
+  const { byCallId, resultEntryIdsByCallId } = buildToolCallIndex(projection);
+  assert.equal(byCallId.get("c1")?.assistantEntryId, a1);
+  assert.deepEqual(resultEntryIdsByCallId.get("c1"), [tr1]);
+  assert.equal(countAssistantTurnsSince(projection, [u1]), 1);
+
+  const sanitized = sanitizeContextEditDrafts(
+    [
+      { type: "context_edit", targetId: customId, replacement: null },
+      { type: "context_edit", targetId: "nonexistent", replacement: null },
+      { type: "context_edit", targetId: omittedUser, replacement: { content: "resurrect?" } },
+      { type: "context_edit", targetId: tr1, replacement: null },
+      { type: "context_edit", targetId: tr1, replacement: { content: "placeholder" } },
+      { type: "context_edit", targetId: u1, replacement: { content: "edited" } },
+    ],
+    projection,
+  );
+  assert.deepEqual(sanitized, [
+    { type: "context_edit", targetId: tr1, replacement: null },
+    { type: "context_edit", targetId: u1, replacement: { content: "edited" } },
+  ]);
+});
