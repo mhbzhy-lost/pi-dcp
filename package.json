@@ -1,6 +1,6 @@
 {
   "name": "@mhbzhy-lost/pi-dcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Minimal Pi 1.6.1-native tail-local context pruning and monotone folding extension built on context_edit.",
   "license": "MIT",
   "type": "module",

@@ -193,3 +193,112 @@ test("rejects unknown toolCallId, micro-fold, bloated summary, and keeps multi-t
   });
   assert.equal(micro.ok, false);
 });
+
+test("reports no compressible entries when only bookkeeping entries follow lastFoldEndEntryId", () => {
+  const sm = createSession();
+  sm.appendMessage(makeUser("u1"));
+  const a1 = sm.appendMessage(makeAssistant({ toolCalls: [makeToolCall("c1", "read", { path: "a.ts" })] }));
+  const tr1 = sm.appendMessage(makeToolResult({ toolCallId: "c1", toolName: "read", text: repeatTokens(3500) }));
+  const cmpA1 = sm.appendMessage(makeAssistant({ toolCalls: [makeToolCall("cmp1", "compress", { topic: "Fold 1", summary: "Summary 1" })] }));
+  const cmpTr1 = sm.appendMessage(makeToolResult({ toolCallId: "cmp1", toolName: "compress", text: "[DCP Fold #1]" }));
+  sm.appendContextEdit(a1, null);
+  sm.appendContextEdit(tr1, null);
+  sm.appendCustomEntry("pi-dcp:state", { version: 1, lastFoldEndEntryId: cmpTr1, foldTurnEntryIds: [cmpA1, cmpTr1], prunedEntryIds: [], foldCount: 1, lastNudgeEntryId: null });
+  sm.appendMessage(makeAssistant({ toolCalls: [makeToolCall("cmp2", "compress", { topic: "Immediate retry", summary: "Summary 2" })] }));
+
+  const state = createEmptyState();
+  state.lastFoldEndEntryId = cmpTr1;
+  state.foldTurnEntryIds = [cmpA1, cmpTr1];
+  state.foldCount = 1;
+
+  const res = planMonotoneFold({
+    args: { topic: "Immediate retry", summary: "Summary 2" },
+    currentToolCallId: "cmp2",
+    contextEntries: sm.buildSessionProjection().entries,
+    state,
+    config: DEFAULT_CONFIG,
+  });
+  assert.equal(res.ok, false);
+  if (!res.ok) assert.equal(res.error, "No compressible entries available in this phase.");
+});
+
+test("failed compress with sibling toolCall does not poison subsequent folds, while succeeded compress protects sibling toolResults atomically", () => {
+  // Case 1: failed compress + sibling bash -> NOT protected, cleanly folded by later compress
+  const sm1 = createSession();
+  sm1.appendMessage(makeUser("u1"));
+  const a1 = sm1.appendMessage(makeAssistant({ toolCalls: [makeToolCall("c1", "read", { path: "a.ts" })] }));
+  const tr1 = sm1.appendMessage(makeToolResult({ toolCallId: "c1", toolName: "read", text: repeatTokens(3500) }));
+  const cmpA1 = sm1.appendMessage(makeAssistant({ toolCalls: [makeToolCall("cmp1", "compress", { topic: "Fold 1", summary: "Summary 1" })] }));
+  const cmpTr1 = sm1.appendMessage(makeToolResult({ toolCallId: "cmp1", toolName: "compress", text: "[DCP Fold #1]" }));
+  sm1.appendContextEdit(a1, null);
+  sm1.appendContextEdit(tr1, null);
+
+  const failA = sm1.appendMessage(makeAssistant({
+    toolCalls: [
+      makeToolCall("cmpFail", "compress", { topic: "Premature", summary: "Bloated retry" }),
+      makeToolCall("b1", "bash", { command: "git status" }),
+    ],
+  }));
+  const failTr = sm1.appendMessage(makeToolResult({ toolCallId: "cmpFail", toolName: "compress", text: "No compressible entries available in this phase.", isError: true }));
+  const bashTr = sm1.appendMessage(makeToolResult({ toolCallId: "b1", toolName: "bash", text: repeatTokens(2000) }));
+  const a2 = sm1.appendMessage(makeAssistant({ toolCalls: [makeToolCall("c2", "read", { path: "b.ts" })] }));
+  const tr2 = sm1.appendMessage(makeToolResult({ toolCallId: "c2", toolName: "read", text: repeatTokens(2000) }));
+  sm1.appendMessage(makeAssistant({ toolCalls: [makeToolCall("cmp2", "compress", { topic: "Fold 2", summary: "Summary 2" })] }));
+
+  const state1 = createEmptyState();
+  state1.lastFoldEndEntryId = cmpTr1;
+  state1.foldTurnEntryIds = [cmpA1, cmpTr1];
+  state1.foldCount = 1;
+
+  const res1 = planMonotoneFold({
+    args: { topic: "Fold 2", summary: "Summary 2" },
+    currentToolCallId: "cmp2",
+    contextEntries: sm1.buildSessionProjection().entries,
+    state: state1,
+    config: DEFAULT_CONFIG,
+  });
+  assert.equal(res1.ok, true);
+  if (res1.ok) {
+    assert.deepEqual(res1.plan.foldedEntryIds, [failA, failTr, bashTr, a2, tr2]);
+  }
+
+  // Case 2: succeeded compress + sibling bash with keepRecentTurns > 0 -> entire turn protected atomically even without foldTurnEntryIds
+  const sm2 = createSession();
+  sm2.appendMessage(makeUser("u1"));
+  const p1 = sm2.appendMessage(makeAssistant({ toolCalls: [makeToolCall("p1", "read", { path: "p1.ts" })] }));
+  const ptr1 = sm2.appendMessage(makeToolResult({ toolCallId: "p1", toolName: "read", text: repeatTokens(3500) }));
+  const p2 = sm2.appendMessage(makeAssistant({ toolCalls: [makeToolCall("p2", "read", { path: "p2.ts" })] }));
+  const ptr2 = sm2.appendMessage(makeToolResult({ toolCallId: "p2", toolName: "read", text: repeatTokens(2000) }));
+  const okCmpA = sm2.appendMessage(makeAssistant({
+    toolCalls: [
+      makeToolCall("cmpOk", "compress", { topic: "Fold 1", summary: "Summary 1", keepRecentTurns: 1 }),
+      makeToolCall("b2", "bash", { command: "ls" }),
+    ],
+  }));
+  const okCmpTr = sm2.appendMessage(makeToolResult({ toolCallId: "cmpOk", toolName: "compress", text: "[DCP Fold #1]" }));
+  const okBashTr = sm2.appendMessage(makeToolResult({ toolCallId: "b2", toolName: "bash", text: "ok" }));
+  sm2.appendContextEdit(p1, null);
+  sm2.appendContextEdit(ptr1, null);
+  const p3 = sm2.appendMessage(makeAssistant({ toolCalls: [makeToolCall("p3", "read", { path: "p3.ts" })] }));
+  const ptr3 = sm2.appendMessage(makeToolResult({ toolCallId: "p3", toolName: "read", text: repeatTokens(2000) }));
+  sm2.appendMessage(makeAssistant({ toolCalls: [makeToolCall("cmpNext", "compress", { topic: "Fold 2", summary: "Summary 2" })] }));
+
+  const state2 = createEmptyState();
+  state2.lastFoldEndEntryId = ptr1;
+  state2.foldCount = 1;
+
+  const res2 = planMonotoneFold({
+    args: { topic: "Fold 2", summary: "Summary 2" },
+    currentToolCallId: "cmpNext",
+    contextEntries: sm2.buildSessionProjection().entries,
+    state: state2,
+    config: DEFAULT_CONFIG,
+  });
+  assert.equal(res2.ok, true);
+  if (res2.ok) {
+    assert.deepEqual(res2.plan.foldedEntryIds, [p2, ptr2, p3, ptr3]);
+    assert.ok(!res2.plan.foldedEntryIds.includes(okCmpA));
+    assert.ok(!res2.plan.foldedEntryIds.includes(okCmpTr));
+    assert.ok(!res2.plan.foldedEntryIds.includes(okBashTr));
+  }
+});

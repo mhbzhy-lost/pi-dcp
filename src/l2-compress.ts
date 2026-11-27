@@ -22,15 +22,17 @@ function extractUserText(pe: ProjectedSessionEntry): string {
 
 function collectProtectedFoldIds(entries: readonly ProjectedSessionEntry[], state: DcpStateData, resultsByCallId: Map<string, string[]>): Set<string> {
   const ids = new Set(state.foldTurnEntryIds);
+  const okResultByCallId = new Set<string>();
+  for (const pe of entries) {
+    for (const msg of pe.messages) if (msg.role === "toolResult" && !msg.isError) okResultByCallId.add(msg.toolCallId);
+  }
   for (const pe of entries) {
     for (const msg of pe.messages) {
       if (!isVisibleAssistant(msg)) continue;
-      for (const b of msg.content) {
-        if (b.type === "toolCall" && b.name === "compress") {
-          ids.add(pe.sourceEntry.id);
-          for (const rid of resultsByCallId.get(b.id) ?? []) ids.add(rid);
-        }
-      }
+      const calls = msg.content.filter((b) => b.type === "toolCall");
+      if (!ids.has(pe.sourceEntry.id) && !calls.some((b) => b.name === "compress" && okResultByCallId.has(b.id))) continue;
+      ids.add(pe.sourceEntry.id);
+      for (const b of calls) for (const rid of resultsByCallId.get(b.id) ?? []) ids.add(rid);
     }
   }
   return ids;
@@ -109,6 +111,7 @@ export function planMonotoneFold(params: {
     }
 
     const sortedIdx = [...selected].sort((a, b) => a - b);
+    if (sortedIdx.length === 0) return { ok: false, error: "No compressible entries available in this phase." };
     if (sortedIdx.length < 2) return { ok: false, error: "Need at least 2 compressible entries to fold." };
     let compressedTokens = 0;
     const preservedUsers: string[] = [];
